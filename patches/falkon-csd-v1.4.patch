@@ -1,0 +1,306 @@
+--- a/src/lib/app/browserwindow.cpp
++++ b/src/lib/app/browserwindow.cpp
+@@ -1,3 +1,7 @@
++#include <QVector>
++#include <QMouseEvent>
++#include <QWindow>
++#include <QApplication>
+ /* ============================================================
+ * Falkon - Qt web browser
+ * Copyright (C) 2010-2018 David Rosca <nowrep@gmail.com>
+@@ -187,6 +191,102 @@
+     return stream;
+ }
+ 
++
++// Falkon CSD: delegate window-edge and corner resize to the Wayland compositor.
++// Never manipulate window geometry during a mouse drag (preserves KWin tiling).
++namespace {
++class FalkonCsdResizeGrip final : public QWidget
++{
++public:
++    FalkonCsdResizeGrip(QWidget *parent, Qt::Edges edges, Qt::CursorShape cursor)
++        : QWidget(parent), m_edges(edges)
++    {
++        setObjectName(QStringLiteral("FalkonCsdResizeGrip"));
++        setCursor(cursor);
++        setMouseTracking(true);
++    }
++
++protected:
++    void mousePressEvent(QMouseEvent *event) override
++    {
++        if (event->button() == Qt::LeftButton) {
++            if (QWindow *handle = window()->windowHandle()) {
++                if (handle->startSystemResize(m_edges)) {
++                    event->accept();
++                    return;
++                }
++            }
++        }
++        QWidget::mousePressEvent(event);
++    }
++
++private:
++    Qt::Edges m_edges;
++};
++
++class FalkonCsdResizeHandles final : public QObject
++{
++public:
++    explicit FalkonCsdResizeHandles(QWidget *top) : QObject(top), m_top(top)
++    {
++        struct Definition { Qt::Edges edges; Qt::CursorShape cursor; };
++        const Definition definitions[] = {
++            {Qt::TopEdge, Qt::SizeVerCursor},
++            {Qt::BottomEdge, Qt::SizeVerCursor},
++            {Qt::LeftEdge, Qt::SizeHorCursor},
++            {Qt::RightEdge, Qt::SizeHorCursor},
++            {Qt::TopEdge | Qt::LeftEdge, Qt::SizeFDiagCursor},
++            {Qt::TopEdge | Qt::RightEdge, Qt::SizeBDiagCursor},
++            {Qt::BottomEdge | Qt::LeftEdge, Qt::SizeBDiagCursor},
++            {Qt::BottomEdge | Qt::RightEdge, Qt::SizeFDiagCursor},
++        };
++        for (const auto &d : definitions) {
++            m_grips.push_back(new FalkonCsdResizeGrip(top, d.edges, d.cursor));
++        }
++        top->installEventFilter(this);
++        updateGrips();
++    }
++
++protected:
++    bool eventFilter(QObject *watched, QEvent *event) override
++    {
++        if (watched == m_top && (event->type() == QEvent::Resize
++                                 || event->type() == QEvent::Show
++                                 || event->type() == QEvent::WindowStateChange)) {
++            updateGrips();
++        }
++        return false;
++    }
++
++private:
++    void updateGrips()
++    {
++        const bool enabled = !m_top->isMaximized() && !m_top->isFullScreen();
++        const int w = m_top->width(), h = m_top->height();
++        constexpr int edge = 7, corner = 13;
++        const QRect shapes[] = {
++            {corner, 0, qMax(0, w - 2 * corner), edge},
++            {corner, h - edge, qMax(0, w - 2 * corner), edge},
++            {0, corner, edge, qMax(0, h - 2 * corner)},
++            {w - edge, corner, edge, qMax(0, h - 2 * corner)},
++            {0, 0, corner, corner},
++            {w - corner, 0, corner, corner},
++            {0, h - corner, corner, corner},
++            {w - corner, h - corner, corner, corner},
++        };
++        for (int i = 0; i < m_grips.size(); ++i) {
++            QWidget *grip = m_grips.at(i);
++            grip->setGeometry(shapes[i]);
++            grip->setVisible(enabled && w > 2 * corner && h > 2 * corner);
++            if (enabled) grip->raise();
++        }
++    }
++
++    QWidget *m_top;
++    QVector<QWidget *> m_grips;
++};
++}
++
+ BrowserWindow::BrowserWindow(Qz::BrowserWindowType type, const QList<QUrl> startUrls)
+     : QMainWindow(nullptr)
+     , m_startUrls(startUrls)
+@@ -361,6 +461,14 @@
+     auto* widget = new QWidget(this);
+     widget->setCursor(Qt::ArrowCursor);
+     setCentralWidget(widget);
++
++    // Opt-in experiment: native Qt client-side tab/titlebar.
++    if (qEnvironmentVariableIntValue("FALKON_CSD") == 1) {
++        setWindowFlag(Qt::FramelessWindowHint, true);
++        // Eight dedicated resize grips provide visible Qt cursors and
++        // native compositor-driven resize gestures on Wayland.
++        new FalkonCsdResizeHandles(this);
++    }
+ 
+     m_mainLayout = new QVBoxLayout(widget);
+     m_mainLayout->setContentsMargins(0, 0, 0, 0);
+--- a/src/lib/navigation/navigationcontainer.cpp
++++ b/src/lib/navigation/navigationcontainer.cpp
+@@ -21,6 +21,49 @@
+ 
+ #include <QPainter>
+ #include <QVBoxLayout>
++#include <QHBoxLayout>
++#include <QToolButton>
++#include <QMouseEvent>
++#include <QWindow>
++#include <QApplication>
++#include <QStyle>
++
++
++namespace {
++class CsdDragArea final : public QWidget
++{
++public:
++    explicit CsdDragArea(QWidget *parent) : QWidget(parent)
++    {
++        setFixedWidth(44);
++        setCursor(Qt::ArrowCursor);
++        setToolTip(QObject::tr("Drag window; double-click to maximize"));
++    }
++protected:
++    void mousePressEvent(QMouseEvent *event) override
++    {
++        if (event->button() == Qt::LeftButton) {
++            if (QWindow *handle = window()->windowHandle()) {
++                if (handle->startSystemMove()) {
++                    event->accept();
++                    return;
++                }
++            }
++        }
++        QWidget::mousePressEvent(event);
++    }
++    void mouseDoubleClickEvent(QMouseEvent *event) override
++    {
++        if (event->button() == Qt::LeftButton) {
++            QWidget *w = window();
++            w->isMaximized() ? w->showNormal() : w->showMaximized();
++            event->accept();
++            return;
++        }
++        QWidget::mouseDoubleClickEvent(event);
++    }
++};
++}
+ 
+ NavigationContainer::NavigationContainer(QWidget* parent)
+     : QWidget(parent)
+@@ -42,7 +85,53 @@
+ void NavigationContainer::setTabBar(TabBar* tabBar)
+ {
+     m_tabBar = tabBar;
+-    m_layout->addWidget(m_tabBar);
++
++    if (qEnvironmentVariableIntValue("FALKON_CSD") == 1) {
++        // Host the ORIGINAL Falkon tab bar beside Qt window controls.
++        // This retains tab sorting, middle-click, dragging and detaching.
++        auto *titleRow = new QWidget(this);
++        titleRow->setObjectName(QStringLiteral("FalkonCsdTitleRow"));
++        auto *row = new QHBoxLayout(titleRow);
++        row->setContentsMargins(4, 0, 3, 0);
++        row->setSpacing(2);
++        row->addWidget(m_tabBar, 1);
++        row->addWidget(new CsdDragArea(titleRow));
++
++        auto *minButton = new QToolButton(titleRow);
++        minButton->setObjectName(QStringLiteral("FalkonCsdWindowButton"));
++        minButton->setIcon(QIcon::fromTheme(QStringLiteral("window-minimize")));
++        minButton->setToolTip(tr("Minimize"));
++        minButton->setFixedSize(34, 30);
++        QObject::connect(minButton, &QToolButton::clicked, this, [this]() {
++            window()->showMinimized();
++        });
++        row->addWidget(minButton);
++        auto *maxButton = new QToolButton(titleRow);
++        maxButton->setObjectName(QStringLiteral("FalkonCsdWindowButton"));
++        maxButton->setIcon(QIcon::fromTheme(QStringLiteral("window-maximize")));
++        maxButton->setToolTip(tr("Maximize / restore"));
++        maxButton->setFixedSize(34, 30);
++        QObject::connect(maxButton, &QToolButton::clicked, this, [this]() {
++            QWidget *w = window();
++            w->isMaximized() ? w->showNormal() : w->showMaximized();
++        });
++        row->addWidget(maxButton);
++        // QWidget::close() returns bool, so handle it separately.
++        auto *closeButton = new QToolButton(titleRow);
++        closeButton->setObjectName(QStringLiteral("FalkonCsdWindowButton"));
++        closeButton->setIcon(QIcon::fromTheme(QStringLiteral("window-close")));
++        closeButton->setToolTip(tr("Close window"));
++        closeButton->setFixedSize(34, 30);
++        QObject::connect(closeButton, &QToolButton::clicked, this, [this]() {
++            window()->close();
++        });
++        row->addWidget(closeButton);
++        m_layout->insertWidget(0, titleRow);
++        titleRow->setProperty("_falkonCsdRow", true);
++        m_layout->setContentsMargins(0, 0, 0, 0);
++    } else {
++        m_layout->addWidget(m_tabBar);
++    }
+ 
+     toggleTabsOnTop(qzSettings->tabsOnTop);
+ }
+@@ -51,9 +140,22 @@
+ {
+     setUpdatesEnabled(false);
+ 
+-    m_layout->removeWidget(m_tabBar);
+-    m_layout->insertWidget(enable ? 0 : m_layout->count(), m_tabBar);
+-    m_layout->setContentsMargins(0, enable ? 2 : 0, 0, enable ? 2 : 0);
++    if (qEnvironmentVariableIntValue("FALKON_CSD") == 1) {
++        // A CSD title row must remain above navigation and bookmarks bars.
++        for (int i = 0; i < m_layout->count(); ++i) {
++            QWidget *item = m_layout->itemAt(i)->widget();
++            if (item && item->property("_falkonCsdRow").toBool()) {
++                m_layout->removeWidget(item);
++                m_layout->insertWidget(0, item);
++                break;
++            }
++        }
++        m_layout->setContentsMargins(0, 0, 0, 0);
++    } else {
++        m_layout->removeWidget(m_tabBar);
++        m_layout->insertWidget(enable ? 0 : m_layout->count(), m_tabBar);
++        m_layout->setContentsMargins(0, enable ? 2 : 0, 0, enable ? 2 : 0);
++    }
+ 
+     setUpdatesEnabled(true);
+ }
+--- a/src/lib/tabwidget/tabbar.cpp
++++ b/src/lib/tabwidget/tabbar.cpp
+@@ -1,3 +1,4 @@
++#include <QWindow>
+ /* ============================================================
+ * Falkon - Qt web browser
+ * Copyright (C) 2010-2018 David Rosca <nowrep@gmail.com>
+@@ -500,8 +501,15 @@
+         return;
+     }
+ 
+-    if (event->buttons() == Qt::LeftButton && emptyArea(event->position().toPoint())) {
+-        m_tabWidget->addView(QUrl(), Qz::NT_SelectedTabAtTheEnd, true);
++    if (event->button() == Qt::LeftButton && emptyArea(event->position().toPoint())) {
++        if (qEnvironmentVariableIntValue("FALKON_CSD") == 1) {
++            // Firefox/Chrome-style blank titlebar double-click on CSD only.
++            QWidget *topLevel = window();
++            topLevel->isMaximized() ? topLevel->showNormal() : topLevel->showMaximized();
++            event->accept();
++        } else {
++            m_tabWidget->addView(QUrl(), Qz::NT_SelectedTabAtTheEnd, true);
++        }
+         return;
+     }
+ 
+@@ -510,6 +518,19 @@
+ 
+ void TabBar::mousePressEvent(QMouseEvent* event)
+ {
++    // Falkon CSD: drag the window from unused tab-bar space.
++    // Keep normal tab dragging, reordering and detaching unchanged.
++    if (qEnvironmentVariableIntValue("FALKON_CSD") == 1
++        && event->button() == Qt::LeftButton
++        && emptyArea(event->position().toPoint())) {
++        if (QWindow *handle = window()->windowHandle()) {
++            if (handle->startSystemMove()) {
++                event->accept();
++                return;
++            }
++        }
++    }
++
+     ComboTabBar::mousePressEvent(event);
+ 
+     if (mApp->plugins()->processMousePress(Qz::ON_TabBar, this, event)) {
